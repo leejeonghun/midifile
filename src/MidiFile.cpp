@@ -432,12 +432,14 @@ bool MidiFile::readSmf(std::istream& input) {
 	//
 
 	uchar runningCommand;
+	bool lastEventWasMetaOrSysex;
 	MidiEvent event;
 	std::vector<uchar> bytes;
 	int xstatus;
 
 	for (int i=0; i<tracks; i++) {
 		runningCommand = 0;
+		lastEventWasMetaOrSysex = false;
 
 		// std::cout << "\nReading Track: " << i + 1 << flush;
 
@@ -515,7 +517,7 @@ bool MidiFile::readSmf(std::istream& input) {
 		while (!input.eof()) {
 			longdata = readVLValue(input);
 			absticks += longdata;
-			xstatus = extractMidiData(input, bytes, runningCommand);
+			xstatus = extractMidiData(input, bytes, runningCommand, lastEventWasMetaOrSysex);
 			if (xstatus == 0) {
 				m_rwstatus = false; return m_rwstatus;
 			}
@@ -2821,7 +2823,7 @@ void MidiFile::buildTimeMap(void) {
 //
 
 int MidiFile::extractMidiData(std::istream& input, std::vector<uchar>& array,
-	uchar& runningCommand) {
+	uchar& runningCommand, bool& lastEventWasMetaOrSysex) {
 
 	int character;
 	uchar byte;
@@ -2836,29 +2838,47 @@ int MidiFile::extractMidiData(std::istream& input, std::vector<uchar>& array,
 		byte = (uchar)character;
 	}
 
+	// eventCommand is the status byte that applies to *this* event.
+	// runningCommand is only updated for channel-voice messages (0x80-0xEF),
+	// so that running status can still be recovered even if a Meta (0xFF)
+	// or SysEx (0xF0/0xF7) event occurred in between (lenient/non-strict
+	// reading, matching what most real-world MIDI players/synths do, even
+	// though the SMF spec says running status should reset after such events).
+	uchar eventCommand;
+
 	if (byte < 0x80) {
 		runningQ = 1;
 		if (runningCommand == 0) {
 			std::cerr << "Error: running command with no previous command" << std::endl;
 			return 0;
 		}
-		if (runningCommand >= 0xf0) {
-			std::cerr << "Error: running status not permitted with meta and sysex"
-			     << " event." << std::endl;
-			std::cerr << "Byte is 0x" << std::hex << (int)byte << std::dec << std::endl;
-			return 0;
+		if (lastEventWasMetaOrSysex) {
+			// This is technically not permitted by the SMF spec (running
+			// status should reset after a Meta or SysEx event), but many
+			// real-world files (and most players/synths) do this anyway.
+			// Log it for visibility, then recover using the last
+			// channel-voice command instead of aborting the parse.
+			std::cerr << "Warning: running status not permitted with meta and sysex"
+			     << " event; recovering using previous channel command 0x"
+			     << std::hex << (int)runningCommand << std::dec << "." << std::endl;
 		}
+		eventCommand = runningCommand;
 	} else {
-		runningCommand = byte;
+		eventCommand = byte;
 		runningQ = 0;
+		if (byte < 0xf0) {
+			runningCommand = byte;
+		}
 	}
+	lastEventWasMetaOrSysex = (eventCommand == 0xff) || (eventCommand == 0xf0) ||
+	                          (eventCommand == 0xf7);
 
-	array.push_back(runningCommand);
+	array.push_back(eventCommand);
 	if (runningQ) {
 		array.push_back(byte);
 	}
 
-	switch (runningCommand & 0xf0) {
+	switch (eventCommand & 0xf0) {
 		case 0x80:        // note off (2 more bytes)
 		case 0x90:        // note on (2 more bytes)
 		case 0xA0:        // aftertouch (2 more bytes)
@@ -2867,16 +2887,22 @@ int MidiFile::extractMidiData(std::istream& input, std::vector<uchar>& array,
 			byte = readByte(input);
 			if (!status()) { return m_rwstatus; }
 			if (byte > 0x7f) {
-				std::cerr << "MIDI data byte too large: " << (int)byte << std::endl;
-				m_rwstatus = false; return m_rwstatus;
+				// Lenient/playback-oriented handling: a corrupted or
+				// non-conforming data byte is clipped into the valid
+				// 7-bit range instead of aborting the entire parse.
+				// (Strict SMF readers should reject this instead.)
+				std::cerr << "Warning: MIDI data byte too large (" << (int)byte
+				     << "), clipping to 7 bits." << std::endl;
+				byte &= 0x7f;
 			}
 			array.push_back(byte);
 			if (!runningQ) {
 				byte = readByte(input);
 				if (!status()) { return m_rwstatus; }
 				if (byte > 0x7f) {
-					std::cerr << "MIDI data byte too large: " << (int)byte << std::endl;
-					m_rwstatus = false; return m_rwstatus;
+					std::cerr << "Warning: MIDI data byte too large (" << (int)byte
+					     << "), clipping to 7 bits." << std::endl;
+					byte &= 0x7f;
 				}
 				array.push_back(byte);
 			}
@@ -2887,14 +2913,15 @@ int MidiFile::extractMidiData(std::istream& input, std::vector<uchar>& array,
 				byte = readByte(input);
 				if (!status()) { return m_rwstatus; }
 				if (byte > 0x7f) {
-					std::cerr << "MIDI data byte too large: " << (int)byte << std::endl;
-					m_rwstatus = false; return m_rwstatus;
+					std::cerr << "Warning: MIDI data byte too large (" << (int)byte
+					     << "), clipping to 7 bits." << std::endl;
+					byte &= 0x7f;
 				}
 				array.push_back(byte);
 			}
 			break;
 		case 0xF0:
-			switch (runningCommand) {
+			switch (eventCommand) {
 				case 0xff:                 // meta event
 					{
 					if (!runningQ) {
@@ -2977,7 +3004,7 @@ int MidiFile::extractMidiData(std::istream& input, std::vector<uchar>& array,
 			break;
 		default:
 			std::cout << "Error reading midifile" << std::endl;
-			std::cout << "Command byte was " << (int)runningCommand << std::endl;
+			std::cout << "Command byte was " << (int)eventCommand << std::endl;
 			return 0;
 	}
 	return 1;

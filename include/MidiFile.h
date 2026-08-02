@@ -309,7 +309,8 @@ class MidiFile {
 	private:
 		int         extractMidiData                 (std::istream& inputfile,
 		                                             std::vector<uchar>& array,
-		                                             uchar& runningCommand);
+		                                             uchar& runningCommand,
+		                                             bool& lastEventWasMetaOrSysex);
 		ulong       readVLValue                     (std::istream& inputfile);
 		ulong       unpackVLV                       (uchar a = 0, uchar b = 0,
 		                                             uchar c = 0, uchar d = 0,
